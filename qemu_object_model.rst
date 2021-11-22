@@ -598,5 +598,5 @@ QEMU初始化阶段，会根据machine的的设备拓扑将所有的设备进行
 5. 参考材料
 ===========
 
-#. https://qemu.readthedocs.io/en/latest/devel/qom.html
-#. https://mikeblog.top/2019/02/15/C-%E5%AF%B9%E8%B1%A1%E6%A8%A1%E5%9E%8B/
+#. QEMU official Document: https://qemu.readthedocs.io/en/latest/devel/qom.html
+#. Inside The C++ Object Model, Stanley B. Lippman著，侯捷译
