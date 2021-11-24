@@ -45,9 +45,9 @@ CPU将从特定的中断处理入口开始取指执行，当中断事件被软�
 
 - **workqueue** : TODO
 
-- **threaded irq** : TODO
+- **threaded IRQ** : TODO
 
-- **irq-resend** : TODO
+- **IRQ resend** : TODO
 
 - **RT_PREEMPT分支的中断线程方案** : 一旦中断产生，所有任务包括RT任务通通都要给中断处理程序让路，如果Top half处理任务较多就会
   对RT任务造成很大的影响，并且这种影响存在较大的不确定性，因此难以准确评估。为了解决这些实时性相关问题，Linux RT_PREEMPT
@@ -89,7 +89,7 @@ softirq是内核执行deferrable function的一套机制，deferrable function�
 
 .. note::
 
-    .. centered:: 开放性话题
+    **开放性话题:**
 
     执行 **Activation** 和 **Exectution** 的CPU是否必须相同?，一方面，deferrable function
     使用的数据往往会在激活前保留在CPU L1$，另外在本CPU上执行也可以避免和其他CPU的调度队列
@@ -387,7 +387,7 @@ ble function，这两个接口都是通过softirq_actino的编号来进行操作
 
 .. note::
 
-    .. centered:: 开放性话题
+    **开放性话题:**
 
     当前内核将__do_softirq()里处理deferrable function的迭代上限设置为10，执行时间设置
     为2ms，这两个值其实应该根据系统负载动态调整，另外，当__do_softirq无法在有限时间内
