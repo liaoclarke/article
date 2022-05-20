@@ -437,7 +437,160 @@ TODO
 4. Threaded IRQ
 ===============
 
-TODO
+.. note::
+  1. 和线程化中断相关的irqflags是IRQ_NESTED_THREAD，IRQF_NO_BALANCING，IRQF_ONESHOT
+  2. 全局配置变量force_irqthreads，内核启动参数“threadirqs”。
+  3. 在irq_flow_handler里调用handle_irq_event，并根据irq_action->handler的返回值，
+     选择是否唤醒irq_action的thread_fn。(函数irq_thread)。
+  4. 在内核线程里调用irq_thread，进一步调用irq_action->thread_fn。
+  5. 线程化之后的中断，需要和其他任务进行同步。
+  6. 中断线程的销毁。
+  7. 中断线程的亲和性。
+..
+
+Linux内核中断框架原生支持在内核线程上下文里处理中断的机制，即Threaded IRQ，
+这种机制支持将 **整个中断处理代码全部放入线程上下文里执行** ，
+在硬件中断上下文里(即top-half)，内核只需要完成基本硬件操作，比如获取中断ID，
+中断ACK和中断EOI，然后根据中断源唤醒对应内核线程，这个机制是Thomas Glexiner在
+2009引入到内核(commit: 3aa551c9b4c4)。
+
+**4.1 中断处理框架回顾**
+
+.. figure:: images/hardware_irq_topology.png
+   :scale: 80 %
+   :align: center
+
+   中断系统物理拓扑
+..
+
+中断系统的物理拓扑大致上可以分为四种模型：
+
+- **基本模型:** 最简单模型，系统里所有中断源都连接到一个中断控制器部件，
+  中断控制器将中断源转换成INTID再投递到CPU上，中断源的INTID互不相同，
+  软件通过中断控制器获取INTID就可以直接调用对应的ISR，
+  比如单片机系统，一块MCU搭配一个8259中断控制器。
+
+- **并联模型:** 系统里有不同类型的中断控制器，中断源连接到不同的中断控制器，
+  中断控制器将中断源转变成INTID再投递到CPU上，
+  连接到相同中断控制器的中断源的INTID互不相同，
+  连接到不同中断控制器的中断源的INTID可以相同(或互不相同)，
+  软件通过不同中断控制器获取INTID也可以调用到正确的ISR，
+  比如，Arm GIC由GICR, GICD，ITS三类中断控制器部件组成，
+  GICD投递到CPU的INTID为32~1019，GICR投递到CPU的INTID为0~31，
+  ITS投递到CPU的INTID为8192~。
+
+- **级联模型:** 系统里有不同类型的中断控制器，他们之间通过级联的方式联接起来，
+  比如，X86的Local-APIC只支持255个中断源，但可以将8259中断控制器级联到Local-APIC
+  上扩展中断数量，或者两个8259级联起来扩展单片机的中断源数量。
+
+- **共享中断模型:** 如果中断控制器的中断引脚数量不足，
+  多个中断源需要共享同一根中断引脚，
+  软件通过中断控制器获取INTID后还需要进一步确定是哪个设备触发了中断。
+  比如，PC主板上的多个PCIe设备的INTx中断会共享同一个中断线。
+
+.. figure:: images/software_irq_topology.png
+   :scale: 80 %
+   :align: center
+
+   Linux中断软件拓扑
+..
+
+Linux内核通过上图描绘的中断架构来支持这几种物理拓扑，这个中断架构有几个特点：
+
+#. 每个物理中断号(hwirq)都对应内核的一个软件中断号(virq)，
+   软件通过各个中断控制器部件读取hwirq，然后将其映射成一个全局唯一的virq。
+   内核是通过virq来识别中断源并调用对应ISR，而不是通过hwirq。
+
+   这样的收益是：(1) 如果中断源修改了亲和性，那么它的hwirq很有可能发生改变，
+   但内核只需要重新将hwirq映射到virq，(2) 允许不同的中断控制器部件返回相同的hwirq，
+   比如，X86上所有Local-APIC返回的hwirq范围都是0~255。
+
+   设备驱动注册中断源时，首先请求内核分配一个全局唯一virq，
+   再请求中断控制器驱动动态分配hwirq，或者从dts里解析出静态定义的hwirq，
+   最后将请求内核为hwirq和virq建立映射关系。
+
+#. 当系统存在多种不同的中断控制器，并且它们既可以采用并联，也可采用级联方式来联接，
+   这些中断控制器对接入的中断都会分配一个hwirq，这样就会为软件带来很多问题：
+   (1) 两个并联的中断控制器会对不同中断源分配相同hwirq，
+   (2) 两个级联的中断控制器，父控制器会给子控制器分配一个hwirq，
+   那么所有连接到子控制器的中断源对父控制器来说就共享同一个hwirq。
+
+   所以，当软件获取了hwirq后，就需要在一个特定的“空间”里才能将其映射成正确的virq，
+   为此，Linux内核引入了一个irq_domain的概念，每个irq_domain构成了一个中断ID空间，
+   每个中断控制器驱动都可以根据开发者需要为其绑定一个独立的irq_domain对象，
+   这个irq_domain对象维护了关联的中断源hwirq和virq间的映射关系，
+   **注意：virq是全局唯一的，但hwirq只能保证是中断控制器内唯一。**
+   当内核通过操作中断控制器获取一个hwirq时，还要利用该中断控制器对应irq_domain对象
+   将其映射为virq，Linux内核所有中断源都归属于某个irq_domain对象，
+   这些irq_domain对象会按照实际中断控制器拓扑来组织成一颗domain tree。
+
+#. 每个中断源的处理函数也是分为两层：flow handler和action handler，
+   内核调用virq对应的中断处理函数时都是先调用对应的flow handler，再调用对应action handler。
+   设备驱动注册中断源时只提供action handler，这action handler包含中断源处理的核心功能，
+   而flow_handler则由中断源关联的irq_domain负责配置，
+   每个irq_domain关联的所有中断源的flow handler可以配置成不同的flow handler。
+
+   Linux内核引入flow handler的目的至少有两个：
+   (1) 将中断处理的基本操作从ISR里剥离，比如，中断ACK，中断EOI，
+   针对边缘或者电平模式的硬件操作流程，tracing等，这些操作大多是硬件操作相关，
+   暴露给驱动开发者既会带来开发负担，也会导致各种问题。
+   (2) 如果中断控制器采用级联的方式，可以利用flow handler来获取真正的hwirq和virq。
+   内核通过父irq_domain获取子irq_domain的hwirq，根据hwirq获取virq并调用flow handler，
+   在flow handler读取子irq_domain的获取触发中断源的hwirq，最终获取对应的virq，
+   所以flow handler为irq_domain级联模式提供了支持。
+
+   +-------------------------+----------------------------------------------------+
+   | handle_simple_irq       | 调用action handler时，不需要额外的硬件操作。       |
+   +-------------------------+----------------------------------------------------+
+   | handle_level_irq        | 处理电平触发模式的中断事件，需要mask中断。         |
+   +-------------------------+----------------------------------------------------+
+   | handle_fasteoi_irq      | 调用中断action handler前，需要执行中断eoi。        |
+   +-------------------------+----------------------------------------------------+
+   | handle_edge_irq         | 处理边缘触发模式的中断事件，需要ack中断。          |
+   +-------------------------+----------------------------------------------------+
+   | handle_edge_eoi_irq     | 处理边缘触发模式的中断事件，需要ack中断和eoi中断。 |
+   +-------------------------+----------------------------------------------------+
+   | handle_fasteoi_ack_irq  | 调用action handler时，需要ack中断和eoi中断。       |
+   +-------------------------+----------------------------------------------------+
+   | handle_fasteoi_mask_irq | 调用action handler时，需要mask中断和eoi中断。      |
+   +-------------------------+----------------------------------------------------+
+
+#. 支持多个中断源共享同一个物理中断号(hwirq)，Linux内核通过在virq上注册多个action 
+   handler形成一个chain的机制来支持中断号共享的问题，
+   内核可以在virq上调用多个action handler，在每个action
+   handler里再检测本次中断是否应该被处理，
+   **而action handler也是Threaded IRQ机制被线程化执行的代码。**
+
+.. code-block:: c
+
+    static void __handle_irq_event_percpu(struct irq_desc *desc, ...) {
+        int res;
+        struct irqaction *action;
+
+        for_each_action_of_desc(desc, action) {
+            res = action->handler(irq, action->dev_id);
+            switch (res) {
+            case IRQ_WAKE_THREAD:
+                __irq_wake_thread(desc, action);
+            case IRQ_HANDLED:
+                ...
+            }
+        }
+    }
+
+..
+
+**4.2 注册threaded IRQ**
+
+**4.3 唤醒threaded IRQ**
+
+**4.4 处理theaded IRQ**
+
+**4.5 Threaded IRQ使用约束**
+
+**4.6 Threaded IRQ亲和性**
+
+**4.7 Theaded IRQ相关配置**
 
 5. IRQ resend
 =============
